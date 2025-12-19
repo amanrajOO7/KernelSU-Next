@@ -16,6 +16,15 @@
 #include <linux/uaccess.h>
 #include <linux/namei.h>
 #include <linux/workqueue.h>
+#ifdef CONFIG_TRACEPOINTS
+#include <linux/tracepoint.h>
+#include <trace/events/sched.h>
+#include <linux/module.h>
+#endif // CONFIG_TRACEPOINTS
+#include <linux/init.h>
+#include <linux/string.h>
+#include <linux/atomic.h>
+#include <linux/rcupdate.h>
 
 #include "manager.h"
 #include "allowlist.h"
@@ -25,6 +34,73 @@
 #include "util.h"
 #include "selinux/selinux.h"
 #include "throne_tracker.h"
+
+#ifdef CONFIG_TRACEPOINTS
+// one-shot (atomic (avoids race(s) across CPUs))
+static atomic_t ksud_root_done = ATOMIC_INIT(0);
+
+// callback_head (static; lifetime for task_work_add)
+static struct callback_head ksud_cb = { .func = NULL };
+
+// task_work callback (root grant after staged boot)
+static void ksud_post_fs_data_cb(struct callback_head *cb)
+{
+	on_post_fs_data();
+}
+
+// exec callback (tracepoint)
+static void ksud_exec_trace(void *ignore,
+			    struct task_struct *p,
+			    pid_t old_pid,
+			    struct linux_binprm *bprm)
+{
+	struct task_struct *init_task;
+
+	// validate
+	if (!bprm || !bprm->filename)
+		return;
+
+	// trigger (first app_process / zygote)
+	const char *base = strrchr(bprm->filename, '/');
+	base = base ? base + 1 : bprm->filename;
+	if (!strcmp(base, "app_process") || !strcmp(base, "app_process64") ||
+		!strcmp(base, "zygote") || !strcmp(base, "zygote64")) {
+
+		// one-shot claim (exit if another (CPU) did)
+		if (atomic_cmpxchg(&ksud_root_done, 0, 1) != 0)
+			return;
+
+		pr_debug("KernelSU: trace exec %s pid=%d (schedule)\n",
+				bprm->filename, p->pid);
+
+		rcu_read_lock();
+		init_task = rcu_dereference(p->real_parent);
+		if (init_task) {
+			ksud_cb.func = ksud_post_fs_data_cb;
+			task_work_add(init_task, &ksud_cb, TWA_RESUME);
+		}
+		rcu_read_unlock();
+	}
+}
+
+// register (late init (tracepoint)) / cleanup (module exit)
+static int __init ksud_tracepoint_init(void)
+{
+	register_trace_sched_process_exec(ksud_exec_trace, NULL);
+	return 0;
+}
+
+// unregister; synchro. rcu (in-flight)
+static void __exit ksud_tracepoint_exit(void)
+{
+	unregister_trace_sched_process_exec(ksud_exec_trace, NULL);
+	synchronize_rcu();
+}
+
+// Note: built-in stays registered (Android didn't like it)
+late_initcall(ksud_tracepoint_init);
+module_exit(ksud_tracepoint_exit);
+#endif // CONFIG_TRACEPOINTS
 
 bool ksu_module_mounted __read_mostly = false;
 bool ksu_boot_completed __read_mostly = false;
